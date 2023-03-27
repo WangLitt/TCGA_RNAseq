@@ -1,0 +1,205 @@
+#读入表达矩阵，进行差异分析
+setwd('D:/Rdata/ROC')
+getwd()
+rm(list=ls())
+
+library(data.table)
+library(DESeq2)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(tidyr)
+
+#表达矩阵及gtf文件
+## unit: log2(count+1)
+exp <- fread( 'TCGA-LIHC.htseq_counts.tsv.gz' ,
+            data.table = F) 
+head(exp[ ,1:4])
+tail(exp[ ,1:4])
+exp <- exp[1:60483,]
+exp$Ensembl_ID <- str_split(exp$Ensembl_ID,"\\.",simplify = T)[,1]
+rownames(exp) <- exp$Ensembl_ID
+
+# 过滤得到基因表达counts矩阵
+org_exp <- floor(2^exp[,-1] - 1 )
+keep_feature <- rowSums (org_exp > 2) > 10
+exp_count <- org_exp[keep_feature, colSums(org_exp) > 1000000]
+
+#基因ID转换,去重
+gtf <- fread( 'gencode.v22.annotation.gene.probeMap' ,header = T, data.table = F)
+anno <- data.frame(Ensembl_ID = gtf$id,SYMBOL = gtf$gene)
+anno$Ensembl_ID <- str_split(anno$Ensembl_ID,"\\.",simplify = T)[,1]
+rm(gtf)
+exp_count$Ensembl_ID <- rownames(exp_count)
+exp_count <- inner_join(exp_count,anno,by="Ensembl_ID") 
+exp_count <- exp_count %>% mutate(rowMean =rowMeans(.[,c(1,ncol(.)-2)])) %>% 
+  arrange(desc(rowMean)) %>% 
+  distinct(SYMBOL,.keep_all = T) %>%
+  column_to_rownames(var="SYMBOL") %>%
+  select(c(-rowMean,-Ensembl_ID))
+
+#分组,差异分析
+group <- ifelse(grepl('01A',colnames(exp_count)),"tumor","normal")
+group <-factor(group,levels = c("tumor","normal"))
+colData <- data.frame(row.names = colnames(exp_count),
+                     group = group)
+dds <- DESeqDataSetFromMatrix(countData = exp_count,
+                              colData = colData,
+                              design = ~group)
+dds$group <- relevel(dds$group, ref ="normal")
+dds <- DESeq(dds)
+res <- results(dds, contrast=c("group","tumor","normal"))
+DEG <- as.data.frame(res[order(res$padj),])
+DEG <- na.omit(DEG)
+
+log2FC_cutoff = log2(2)
+padj_cutoff = 0.05
+k1 <- (DEG$padj < 0.05)&(DEG$log2FoldChange < -log2FC_cutoff)
+k2 <- (DEG$padj < 0.05)&(DEG$log2FoldChange > log2FC_cutoff)
+DEG$Change <- ifelse(k1,"DOWN",ifelse(k2,"UP","NOT"))
+table(DEG$Change)
+
+save(dds,tpm,exp_count,DEG,file='LIHC.Rdata')
+load(file='LIHC.Rdata')
+
+#PCA图
+vsd <- vst(dds, blind=FALSE)
+pdf('PCA.pdf',6,4)
+pcaPlot <- plotPCA(vsd, intgroup=c("group")) +
+  stat_ellipse(aes(fill = group), geom = 'polygon', 
+               level = 0.95, alpha = 0.1, show.legend = FALSE)
+dev.off()
+
+#MA图
+pdf('MA.pdf',6,4)
+MAplot <- plotMA(res,ylim=c(-8,8))
+dev.off()
+
+#火山图
+need_DEG <- DEG[,c(2,6,7)]
+title <- paste0(' Up :  ',nrow(need_DEG[need_DEG$Change =='UP',]) ,
+                '\n Down : ',nrow(need_DEG[need_DEG$Change =='DOWN',]),
+                '\n FoldChange >= ',round(2^log2FC_cutoff,3),
+                '\n padj <',padj_cutoff)
+g <- ggplot(data=need_DEG, 
+            aes(x=log2FoldChange, y=-log10(padj), 
+                color=Change)) +
+  geom_point(alpha=0.4, size=1) +
+  theme_classic()+
+  xlab("log2 ( FoldChange )") + 
+  ylab("-log10 ( P.adjust )") +
+  ggtitle( title ) +
+  scale_colour_manual(values = c('blue','grey','red'))+ 
+  geom_vline(xintercept = c(-log2FC_cutoff,log2FC_cutoff),lty=4,col="grey",lwd=0.8) +
+  geom_hline(yintercept = -log10(padj_cutoff),lty=4,col="grey",lwd=0.8) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        plot.margin=unit(c(2,2,2,2),'lines'), #上右下左
+        legend.title = element_blank(), 
+        legend.position="right") 
+
+ggsave(g,filename = 'volcano.pdf',width =8,height =7.5)
+
+#热图,取前50 padj上下调的基因
+library("pheatmap")
+vstdat <- assay(vsd)[,order(colData$group)]
+gene_up <- rownames(need_DEG[with(need_DEG,log2FoldChange>log2FC_cutoff & padj<padj_cutoff),])
+gene_down <- rownames(need_DEG[with(need_DEG,log2FoldChange< -log2FC_cutoff & padj<padj_cutoff),])
+cg <- c(head(gene_up, 50),   
+        head(gene_down, 50))
+cg <- na.omit(match(cg,rownames(vstdat))) 
+
+pheatmap::pheatmap(vstdat[cg,],
+                   show_colnames =F,
+                   show_rownames = F,
+                   fontsize = 7 ,
+                   cluster_rows = T,
+                   cluster_cols = F,
+                   annotation_col=colData,
+                   filename = 'heatmap_DEG.pdf')
+
+#导入自噬基因与差异基因取交集
+library(xlsx)
+Autophagy <- read.xlsx('Autophagy.xlsx',1)
+DEGJoin <- DEG %>% 
+    dplyr::filter(
+    rownames(.) %in% Autophagy$Symbol,
+    !Change == 'NOT') 
+DEGvstSurvival <- t(vstdat[rownames(DEGJoin),])
+
+#临床信息矩阵整理
+pt <- fread('TCGA-LIHC.GDC_phenotype.tsv.gz')
+phty <- data.frame(
+  samples = pt$submitter_id.samples,
+  time = pt$days_to_last_follow_up.diagnoses,
+  status = pt$vital_status.demographic,
+  age = pt$age_at_initial_pathologic_diagnosis,
+  gender = pt$gender.demographic,
+  grade = pt$neoplasm_histologic_grade,
+  stage = pt$tumor_stage.diagnoses,
+  M_stage = pt$pathologic_M,
+  N_stage = pt$pathologic_N,
+  T_stage = pt$pathologic_T)
+phty$time[which(phty$status == 'Dead')] <- pt$days_to_death.demographic[which(pt$vital_status.demographic == 'Dead')]
+#Alive=0, Dead=1
+phty$censor <- ifelse(phty$status == 'Alive',0,1)
+DEGvstSurvival <- cbind(phty[phty$samples %in% rownames(DEGvstSurvival),],DEGvstSurvival)
+rownames(DEGvstSurvival) <- DEGvstSurvival$samples
+DEGvstSurvival <- DEGvstSurvival %>%
+  dplyr::filter(
+    substr(DEGvstSurvival$samples,14,15) < 10,
+    !grade == '',
+    !stage == 'not reported'
+    )  
+DEGvstSurvival <- DEGvstSurvival[,-1]
+DEGvstSurvival$gender <- as.factor(DEGvstSurvival$gender)
+DEGvstSurvival$grade <- factor(DEGvstSurvival$grade,levels = c("G1","G2","G3","G4"),ordered = T)
+DEGvstSurvival$stage <- str_extract(DEGvstSurvival$stage,pattern = "(iv|i{1,3})")
+DEGvstSurvival$stage <- factor(DEGvstSurvival$stage,levels = c("i","ii","iii","iv"),ordered = T)
+
+#多因素预后模型构建,筛选z值p值<0.05
+library(survival)
+#surCOX <- summary(coxph(Surv(time,censor==1)~age+gender+grade+stage,data = DEGvstSurvival))
+colnames(DEGvstSurvival) <- gsub(colnames(DEGvstSurvival) ,pattern = '-',replacement = '_')
+gene_list <- (colnames(DEGvstSurvival))[11:ncol(DEGvstSurvival)]
+uni_COX <- function(singlegene){
+  formula <- as.formula(paste0('Surv(time,censor==1)~',singlegene))
+  surCOX <- summary(coxph(formula,data=DEGvstSurvival))
+  #PHp <- cox.zph(coxph(formula,data=DEGvstSurvival))$table[1,3]
+  if (surCOX$coefficients[,5] < 0.05 ){
+    report <- data.frame('gene' = singlegene,
+                         'beta' = surCOX$coefficients[,1],
+                         'HR' = surCOX$coefficients[,2],
+                         'z_pvalue' = surCOX$coefficients[,5])
+    return = report
+  }
+}
+uni_COXList <- lapply(gene_list, uni_COX)
+uni_COXtable <- do.call(rbind,uni_COXList )
+
+#仅筛选出一个基因，只能做单基因预后
+library(rms)
+model <- cph(Surv(time,censor==1)~GRID1,data=DEGvstSurvival,
+             x=T, y=T, surv=T)
+pred <- predict(model,DEGvstSurvival,type = 'lp')
+ROC_table <- data.frame(time=DEGvstSurvival[,'time'],
+                        censor=DEGvstSurvival[,'censor'],
+                        score=pred)
+#summary(DEGvstSurvival$time)
+tROC <- timeROC(T = ROC_table$time,
+                delta = ROC_table$censor,
+                marker = ROC_table$score,
+                cause = 1,
+                times = c(1*365,3*365,5*365),
+                ROC=T)
+pdf('ROC.pdf',5,5)
+par(mar= c(5,5,1,1),cex.lab=1.5,cex.axis= 1.2)
+plot(tROC,time=365,col="red",title=F,lwd=2) 
+plot(tROC,time=1095,col="green",add=T,title=F,lwd=2) 
+plot(tROC,time=1825,col="blue",add=T,title=F,lwd=2) 
+legend(0,1, 
+      c(paste0("AUC at 1 years  ", round(tROC$AUC[1], 2)),
+         paste0("AUC at 3 years  ", round(tROC$AUC[2], 2)),
+         paste0("AUC at 5 years  ", round(tROC$AUC[3], 2))),
+      col=c("red","green","blue"),lwd=2,cex=1.2,bty="n")
+dev.off()
