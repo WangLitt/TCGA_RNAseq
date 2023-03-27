@@ -1,0 +1,84 @@
+#读入表达矩阵，进行差异分析
+setwd('D:/Rdata/ROC')
+getwd()
+rm(list=ls())
+options(stringsAsFactors = F)
+
+library(data.table)
+library(DESeq2)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(tidyr)
+
+#表达矩阵及gtf文件
+## unit: log2(count+1)
+exp <- fread( 'TCGA-LIHC.htseq_counts.tsv.gz' ,
+            data.table = F) 
+head(exp[ ,1:4])
+tail(exp[ ,1:4])
+exp <- exp[1:60483,]
+exp$Ensembl_ID <- str_split(exp$Ensembl_ID,"\\.",simplify = T)[,1]
+rownames(exp) <- exp$Ensembl_ID
+
+# 过滤得到基因表达counts矩阵
+org_exp <- floor(2^exp[,-1] - 1 )
+keep_feature <- rowSums (org_exp > 2) > 10
+exp_count <- org_exp[keep_feature, colSums(org_exp) > 1000000]
+
+#counts，tpm转换
+#第一种：此例中由于IOBR包使用biomaRt中参考基因组注释版本与
+#TCGA参考基因组注释版本不同，所以会有值匹配不上
+library("IOBR")
+tpm1 <- count2tpm(countMat = exp_count,
+                 idType = 'Ensembl')
+
+#第二种：通过读入fpkm转化
+fpkm <- fread('TCGA-LIHC.htseq_fpkm.tsv.gz',header = T,data.table = F)
+fpkm$Ensembl_ID <- str_split(fpkm$Ensembl_ID,"\\.",simplify = T)[,1]
+rownames(fpkm) <- fpkm$Ensembl_ID
+fpkmToTpm <- function(fpkm){
+  exp(log(fpkm) - log(sum(fpkm)) + log(1e6))}
+tpm2 <- fpkmToTpm(fpkm[,-1])
+
+
+#基因ID转换,去重
+gtf <- fread( 'gencode.v22.annotation.gene.probeMap' ,header = T, data.table = F)
+anno <- data.frame(Ensembl_ID = gtf$id,SYMBOL = gtf$gene)
+anno$Ensembl_ID <- str_split(anno$Ensembl_ID,"\\.",simplify = T)[,1]
+rm(gtf)
+
+IDtrans <- function(exp){
+  exp$Ensembl_ID <- rownames(exp)
+  exp <- merge(exp, anno,by ='Ensembl_ID')
+  exp <- exp %>% mutate(rowMean =rowMeans(.[,c(2,ncol(.)-1)])) %>% 
+    arrange(desc(rowMean)) %>% 
+    distinct(SYMBOL,.keep_all = T) %>%
+    column_to_rownames(var="SYMBOL") %>%
+    select(c(-rowMean,-Ensembl_ID))}
+exp_count <- IDtrans(exp = exp_count)
+tpm2 <- IDtrans(tpm2)
+
+#分组,差异分析
+group <- ifelse(grepl('01A',colnames(exp_count)),"tumor","normal")
+group <-factor(group,levels = c("tumor","normal"))
+colData <- data.frame(row.names = colnames(exp_count),
+                     group = group)
+dds <- DESeqDataSetFromMatrix(countData = exp_count,
+                              colData = colData,
+                              design = ~group)
+dds$group <- relevel(dds$group, ref ="normal")
+dds <- DESeq(dds)
+res <- results(dds, contrast=c("group","tumor","normal"))
+DEG <- as.data.frame(res[order(res$padj),])
+DEG <- na.omit(DEG)
+
+log2FC_cutoff = log2(2)
+padj_cutoff = 0.05
+k1 <- (DEG$padj < 0.01)&(DEG$log2FoldChange < -log2FC_cutoff)
+k2 <- (DEG$padj < 0.01)&(DEG$log2FoldChange > log2FC_cutoff)
+DEG$Change <- ifelse(k1,"DOWN",ifelse(k2,"UP","NOT"))
+table(DEG$Change)
+
+save(dds,tpm,exp_count,DEG,file='LIHC.Rdata')
