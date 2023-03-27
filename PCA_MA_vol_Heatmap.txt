@@ -1,0 +1,96 @@
+## PCA分析
+#第一种：
+dat <- log2(tpm+1)
+dat <- scale(dat)
+dat <- t(scale(t(dat),center=TRUE,scale=F))
+
+pca <- prcomp(t(dat),center=FALSE,scale.=FALSE)
+pca_mat <- data.frame(pc1=pca$x[,1],pc2=pca$x[,2],
+                      sample=rownames(colData),group=colData$group)
+PCAPlot1 <- ggplot(pca_mat,aes(x=pc1,y=pc2,label=F,colour=group)) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0,linetype='dotdash',size=0.8,color='grey') +
+  geom_vline(xintercept=0,linetype='dotdash',size=0.8,color='grey') +
+  theme_bw() +
+  theme(plot.title=element_text(hjust=0.5))
+PCAPlot1 + stat_ellipse(aes(fill = group), geom = 'polygon', 
+                        level = 0.95, alpha = 0.1, show.legend = FALSE)
+
+#第二种
+library(FactoMineR)
+library(factoextra)
+dat <- log2(tpm+1)
+dat.pca <- PCA(t(dat) , graph = F)
+PCAPlot <- fviz_pca_ind(dat.pca,
+             geom.ind = c("point"),  #point显示点，text显示文字
+             habillage = factor(colData$Group), # color by groups
+             palette = c("#00AFBB", "#E7B800",'red'),
+             addEllipses = TRUE,  #加置信区间椭圆
+             label = "all",
+             labelsize = 3, pointsize = 3,
+             mean.point = FALSE)+
+  ggprism::theme_prism(border = TRUE,base_rect_size = 1.2)+
+  labs(title = '',
+       x=paste0('PC1','(',round(pca[["eig"]][1,2],2),'%)'),
+       y=paste0('PC2','(',round(pca[["eig"]][2,2],2),'%)'))+
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 15))
+
+#第三种
+#为了方便下游分析，DESeq2提供两种数据标准化方法:VST(variance stabilizing transformations)
+#和rlog(regularized logarithm)。这两种方法都使用了log2缩放
+#并且已经进行了library size 或其他normalization factors的校正；
+#这两种算法有着相同的特性，但大样本时（比如100个样本）VST运算更快，推荐使用VST。
+#对于这两种算法的结果差异，本质上是y＝log2(n＋n0)公式中n0的估计值不一样。
+#默认情况下blind=TRUE，但由于已经使用过DESeq()函数，无需重新估计dispersion值，因此这里blind=FALSE
+vsd <- vst(dds, blind=FALSE)
+pcaPlot <- plotPCA(vsd, intgroup=c("group")) +
+  stat_ellipse(aes(fill = group), geom = 'polygon', 
+               level = 0.95, alpha = 0.1, show.legend = FALSE)
+
+#MA图
+pdf('MA.pdf',6,4)
+MAplot <- plotMA(res,ylim=c(-8,8))
+dev.off()
+
+#火山图
+need_DEG <- DEG[,c(2,6,7)]
+title <- paste0(' Up :  ',nrow(need_DEG[need_DEG$Change =='UP',]) ,
+                '\n Down : ',nrow(need_DEG[need_DEG$Change =='DOWN',]),
+                '\n FoldChange >= ',round(2^log2FC_cutoff,3),
+                '\n padj <',padj_cutoff)
+g <- ggplot(data=need_DEG, 
+            aes(x=log2FoldChange, y=-log10(padj), 
+                color=Change)) +
+  geom_point(alpha=0.4, size=1) +
+  theme_classic()+
+  xlab("log2 ( FoldChange )") + 
+  ylab("-log10 ( P.adjust )") +
+  ggtitle( title ) +
+  scale_colour_manual(values = c('blue','grey','red'))+ 
+  geom_vline(xintercept = c(-log2FC_cutoff,log2FC_cutoff),lty=4,col="grey",lwd=0.8) +
+  geom_hline(yintercept = -log10(padj_cutoff),lty=4,col="grey",lwd=0.8) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        plot.margin=unit(c(2,2,2,2),'lines'), #上右下左
+        legend.title = element_blank(), 
+        legend.position="right") 
+
+ggsave(g,filename = 'volcano.pdf',width =8,height =7.5)
+
+#热图,取前50 padj上下调的基因
+library("pheatmap")
+vstdat <- assay(vsd)[,order(colData$group)]
+gene_up <- rownames(need_DEG[with(need_DEG,log2FoldChange>log2FC_cutoff & padj<padj_cutoff),])
+gene_down <- rownames(need_DEG[with(need_DEG,log2FoldChange< -log2FC_cutoff & padj<padj_cutoff),])
+cg <- c(head(gene_up, 50),   
+        head(gene_down, 50))
+cg <- na.omit(match(cg,rownames(vstdat))) 
+
+pheatmap::pheatmap(vstdat[cg,],
+                   show_colnames =F,
+                   show_rownames = F,
+                   fontsize = 7 ,
+                   cluster_rows = T,
+                   cluster_cols = F,
+                   annotation_col=colData,
+                   filename = 'heatmap_DEG.pdf')
